@@ -6,12 +6,13 @@
 #include <ESP32Servo.h>
 #include <ArduinoJson.h>
 
-// Wi-Fi Config
+// Wi-Fi Config for Wokwi
 const char* ssid = "Wokwi-GUEST";
 const char* password = "";
 
 // MQTT Config
-const char* mqtt_server = "broker.hivemq.com";
+// Using EMQX public broker (very stable with Wokwi virtual WiFi gateway)
+const char* mqtt_server = "broker.emqx.io";
 const int mqtt_port = 1883;
 const char* topic_base = "bmu/iotnaa/smartparking-g01";
 const char* node_id = "A";
@@ -78,20 +79,27 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void reconnectMQTT() {
-  while (!client.connected()) {
-    Serial.print("Connecting to MQTT broker...");
-    String clientId = "ESP32-SmartParking-A-" + String(random(0xffff), HEX);
+  int attempts = 0;
+  while (!client.connected() && attempts < 5) {
+    attempts++;
+    Serial.print("Connecting to MQTT broker (");
+    Serial.print(mqtt_server);
+    Serial.print(")...");
+    
+    // Generate clean unique client ID
+    String clientId = "ESP32-SmartParking-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    
     if (client.connect(clientId.c_str())) {
-      Serial.println("connected!");
+      Serial.println(" connected successfully!");
       char cmdTopic[80];
       snprintf(cmdTopic, sizeof(cmdTopic), "%s/%s/cmd/gate", topic_base, node_id);
       client.subscribe(cmdTopic);
-      Serial.print("Subscribed to: ");
+      Serial.print("Subscribed to command topic: ");
       Serial.println(cmdTopic);
     } else {
-      Serial.print("failed, rc=");
+      Serial.print(" failed, rc=");
       Serial.print(client.state());
-      Serial.println(" retrying in 2 seconds...");
+      Serial.println(" (retrying in 2 seconds)...");
       delay(2000);
     }
   }
@@ -128,7 +136,8 @@ void updateOLED() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting ESP32 Smart Parking Node A...");
+  delay(100);
+  Serial.println("\nStarting ESP32 Smart Parking Node A...");
 
   for (int i = 0; i < 4; i++) {
     pinMode(TRIG_PINS[i], OUTPUT);
@@ -145,29 +154,42 @@ void setup() {
 
   Wire.begin(21, 22);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 allocation failed");
+    Serial.println("SSD1306 OLED initialization failed");
   } else {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(10, 20);
-    display.println("Initializing...");
+    display.println("Connecting WiFi...");
     display.display();
   }
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to Wi-Fi");
+  Serial.print("Connecting to Wokwi Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println(" Connected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
 
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);
+  client.setBufferSize(512);
+  client.setKeepAlive(30);
+
+  reconnectMQTT();
 }
 
 void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, password);
+    delay(500);
+    return;
+  }
+  
   if (!client.connected()) {
     reconnectMQTT();
   }
@@ -200,12 +222,14 @@ void loop() {
 
       char topic[80];
       snprintf(topic, sizeof(topic), "%s/%s/slot%d", topic_base, node_id, i + 1);
-      client.publish(topic, jsonBuffer);
-
-      Serial.print("Published to ");
-      Serial.print(topic);
-      Serial.print(": ");
-      Serial.println(jsonBuffer);
+      
+      if (client.connected()) {
+        client.publish(topic, jsonBuffer);
+        Serial.print("Published to ");
+        Serial.print(topic);
+        Serial.print(": ");
+        Serial.println(jsonBuffer);
+      }
     }
 
     digitalWrite(GREEN_LED, anyAvailable ? HIGH : LOW);

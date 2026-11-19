@@ -13,8 +13,8 @@ import numpy as np
 import paho.mqtt.client as mqtt
 
 TOPIC_BASE = os.environ.get("TOPIC_BASE", "bmu/iotnaa/smartparking-g01")
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "broker.hivemq.com")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_BROKERS = ["broker.emqx.io", "broker.hivemq.com"]
+MQTT_PORT = 1883
 MQTT_ENABLED = os.environ.get("MQTT_ENABLED", "true").lower() == "true"
 DB_PATH = Path("/Users/deveshyadav/Desktop/smartparking_project/backend/parking.db")
 
@@ -30,7 +30,7 @@ current_slots = {
     for z in ZONES for s in range(1, SLOTS_PER_ZONE + 1)
 }
 
-mqtt_client = None
+mqtt_clients = []
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +71,7 @@ def log_sensor_reading(node, slot, dist, occ, ts, src):
                 (node, slot, dist, occ, ts, src)
             )
             conn.commit()
-    except Exception as e:
+    except Exception:
         pass
 
 def aggregate_and_log_occupancy():
@@ -117,27 +117,32 @@ def on_mqtt_message(_client, _userdata, msg):
         pass
 
 def setup_mqtt():
-    global mqtt_client
+    global mqtt_clients
     if not MQTT_ENABLED:
         return
-    try:
-        mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2 if hasattr(mqtt, "CallbackAPIVersion") else None)
-        mqtt_client.on_message = on_mqtt_message
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        subscribe_topic = f"{TOPIC_BASE}/+/+"
-        mqtt_client.subscribe(subscribe_topic)
-        mqtt_client.loop_start()
-    except Exception:
-        pass
+    for broker in MQTT_BROKERS:
+        try:
+            cli = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+            cli.on_message = on_mqtt_message
+            cli.connect(broker, MQTT_PORT, 60)
+            cli.subscribe(f"{TOPIC_BASE}/+/+")
+            cli.loop_start()
+            mqtt_clients.append(cli)
+            print(f"Connected to MQTT broker: {broker}")
+        except Exception as e:
+            print(f"Failed to connect to {broker}: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     setup_mqtt()
     yield
-    if mqtt_client:
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+    for cli in mqtt_clients:
+        try:
+            cli.loop_stop()
+            cli.disconnect()
+        except Exception:
+            pass
 
 app = FastAPI(title="Smart Parking API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
@@ -150,7 +155,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "broker": MQTT_BROKER, "topic_base": TOPIC_BASE}
+    return {"status": "ok", "brokers": MQTT_BROKERS, "topic_base": TOPIC_BASE}
 
 @app.get("/slots")
 def get_slots():
@@ -225,6 +230,10 @@ def control_gate(action: str, zone: str = "A"):
     if action not in ["open", "close"]:
         raise HTTPException(status_code=400, detail="Action must be 'open' or 'close'")
     topic = f"{TOPIC_BASE}/{zone}/cmd/gate"
-    if mqtt_client and mqtt_client.is_connected():
-        mqtt_client.publish(topic, action)
+    for cli in mqtt_clients:
+        try:
+            if cli.is_connected():
+                cli.publish(topic, action)
+        except Exception:
+            pass
     return {"status": "success", "action": action, "topic": topic}
